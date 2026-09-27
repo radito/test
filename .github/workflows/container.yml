@@ -1,0 +1,165 @@
+name: Container
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - {platform: linux/arm64, slug: arm64, file: Dockerfile}
+          - {platform: linux/amd64, slug: amd64, file: Dockerfile}
+          - {platform: linux/amd64/v2, slug: amd64-v2, file: Dockerfile}
+          - {platform: linux/riscv64, slug: riscv64, file: Dockerfile}
+          - {platform: linux/ppc64le, slug: ppc64le, file: Dockerfile}
+          - {platform: linux/s390x, slug: s390x, file: Dockerfile}
+          - {platform: linux/386, slug: 386, file: Dockerfile}
+          - {platform: linux/mips64le, slug: mips64le, file: Dockerfile.mips}
+          - {platform: linux/mips64, slug: mips64, file: Dockerfile.mips}
+          - {platform: linux/arm/v7, slug: arm-v7, file: Dockerfile}
+          - {platform: linux/arm/v6, slug: arm-v6, file: Dockerfile}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build test image
+        run: |
+          docker buildx build --platform '${{ matrix.platform }}' \
+            --file '${{ matrix.file }}' --load --tag test-id:test .
+
+      - name: Test HTTP, TCP, and UDP
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=$(docker run -d --name test-id --platform '${{ matrix.platform }}' \
+            -p 127.0.0.1::8080/tcp \
+            -p 127.0.0.1::8081/tcp \
+            -p 127.0.0.1::8082/udp test-id:test)
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          http_port=$(docker port "$container" 8080/tcp | cut -d: -f2)
+          tcp_port=$(docker port "$container" 8081/tcp | cut -d: -f2)
+          udp_port=$(docker port "$container" 8082/udp | cut -d: -f2)
+          expected=${container:0:12}
+
+          http_response=$(curl --http1.1 --fail --silent --show-error --include \
+            --retry 10 --retry-delay 1 --retry-connrefused \
+            "http://127.0.0.1:$http_port/")
+          [[ "$http_response" == $'HTTP/1.1 200 OK\r\n'* ]]
+          test "${http_response#*$'\r\n\r\n'}" = "$expected"
+
+          tcp_response=$(timeout 5 nc -N -w 2 127.0.0.1 "$tcp_port" </dev/null)
+          test "$tcp_response" = "$expected"
+
+          udp_response=$(printf ping | timeout 5 nc -u -w 2 127.0.0.1 "$udp_port" || true)
+          test "$udp_response" = "$expected"
+          echo 'HTTP/1.1, TCP, and UDP responses match the container ID'
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push platform image by digest
+        if: github.event_name != 'pull_request'
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/radito/test,push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          provenance: false
+          sbom: false
+
+      - name: Save digest
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/radito/test
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble and inspect multiarchitecture image
+        shell: bash
+        env:
+          IMAGE: ghcr.io/radito/test
+          TAGS_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          image=${IMAGE,,}
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$TAGS_JSON")
+          test "${#tags[@]}" -gt 0
+          args=()
+          for tag in "${tags[@]}"; do
+            args+=(--tag "$tag")
+          done
+          sources=()
+          for digest_file in "$RUNNER_TEMP"/digests/*; do
+            sources+=("$image@sha256:$(basename "$digest_file")")
+          done
+          test "${#sources[@]}" -eq 11
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${tags[0]}"

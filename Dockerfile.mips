@@ -1,0 +1,42 @@
+FROM --platform=linux/amd64 debian:bookworm-slim AS build
+
+ARG TARGETARCH
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl xz-utils && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      mips64) \
+        target=mips64-unknown-linux-musl; \
+        checksum=aab9e7d0d44938395b0d5c3083b2f51a0fbad357d33b850409934a3b5a465cc7 ;; \
+      mips64le) \
+        target=mips64el-unknown-linux-musl; \
+        checksum=d2a0f35bbfe688afda90e16f6ef8838df6a0d2561599f1afcddb402805965ab7 ;; \
+      *) exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/cross-tools/musl-cross/releases/download/20260515/$target.tar.xz" -o toolchain.tar.xz; \
+    echo "$checksum  toolchain.tar.xz" | sha256sum -c -; \
+    mkdir -p /opt/toolchains; \
+    tar -xJf toolchain.tar.xz -C /opt/toolchains; \
+    echo "$target" > /build/target
+
+COPY server.c /build/server.c
+
+RUN set -eu; \
+    target=$(cat /build/target); \
+    "/opt/toolchains/$target/bin/$target-gcc" \
+      -Os -ffunction-sections -fdata-sections -static \
+      -Wl,--gc-sections -s -o /server /build/server.c
+
+FROM scratch
+
+COPY --from=build /server /server
+
+USER 65534:65534
+EXPOSE 8080/tcp
+EXPOSE 8081/tcp
+EXPOSE 8082/udp
+ENTRYPOINT ["/server"]
